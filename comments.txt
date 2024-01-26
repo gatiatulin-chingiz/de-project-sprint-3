@@ -1,0 +1,56 @@
+Привет, Светлана! Спасибо за ревью!
+
+Мне подсказали как сделать, сделал по-другому
+Скрипт вроде отрабатывает нормально...
+Остальные комментарии тоже постарался поправить
+
+Пытался сделать как ты писала в части f_customer_retention, но до конца так и не смог доделать (ниже прикладываю, что получилось)
+
+
+with customers AS
+        (select *
+         from mart.f_sales
+         join mart.d_calendar on f_sales.date_id = d_calendar.date_id
+         where week_of_year = DATE_PART('week', '{{ds}}'::DATE))),
+     new_customers AS
+        (select customer_id
+         from mart.f_sales
+         join mart.d_calendar on f_sales.date_id = d_calendar.date_id
+         where week_of_year = DATE_PART('week', '{{ds}}'::DATE))
+           AND status = 'shipped'
+         GROUP BY customer_id
+         HAVING count(customer_id) = 1),
+     returning_customers AS
+        (select customer_id
+         from mart.f_sales
+         join mart.d_calendar on f_sales.date_id = d_calendar.date_id
+         where week_of_year = DATE_PART('week', '{{ds}}'::DATE))
+           AND status = 'shipped'
+         GROUP BY customer_id
+         HAVING count(customer_id) > 1),
+     refunded_customers AS
+        (select customer_id
+         from mart.f_sales
+         join mart.d_calendar on f_sales.date_id = d_calendar.date_id
+         where week_of_year = DATE_PART('week', '{{ds}}'::DATE))
+           AND payment_amount < 0
+         GROUP BY customer_id)
+select COALESCE(new_customers.customers, 0) as new_customers_count,
+       COALESCE(returning_customers.customers, 0) as returning_customers_count,
+       COALESCE(refunded_customers.customers, 0) as refunded_customer_count,
+       'weekly' AS period_name
+FROM (select week_of_year,
+             city_id,
+             item_id,
+             sum(payment_amount) as revenue,
+             sum(quantity)       as items,
+             count(*)            as customers
+      from customers
+      where status = 'shipped'
+        and customer_id in (select customer_id from returning_customers)
+      group by week_of_year, city_id, item_id) returning_customers
+FULL JOIN
+ on new_customers.week_of_year = refunded_customers.week_of_year
+ and new_customers.item_id = refunded_customers.item_id
+ and new_customers.city_id = refunded_customers.city_id;
+

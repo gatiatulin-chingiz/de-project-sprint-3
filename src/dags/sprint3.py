@@ -5,20 +5,25 @@ import pandas as pd
 
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.hooks.http_hook import HttpHook
+from airflow.providers.http.hooks.http import HttpHook
 
+###API settings###
+#set api connection from HttpHook
 http_conn_id = HttpHook.get_connection('http_conn_id')
-api_key = http_conn_id.extra_dejson.get('api_key')
-base_url = http_conn_id.host
+api_key = http_conn_id.extra_dejson.get('api_key') #5f55e6c0-e9e5-4a9c-b313-63c01fc31460
+base_url = http_conn_id.host #https://d5dg1j9kt695d30blp03.apigw.yandexcloud.net
 
+# Define PostgreSQL connection ID
 postgres_conn_id = 'postgresql_de'
 
+# Constants for nickname and cohort
 nickname = 'gatiatulin.chingiz'
 cohort = '21'
 
+# Define headers for API requests
 headers = {
     'X-Nickname': nickname,
     'X-Cohort': cohort,
@@ -27,7 +32,7 @@ headers = {
     'Content-Type': 'application/x-www-form-urlencoded'
 }
 
-
+# Function to generate a report and push task_id to XCom
 def generate_report(ti):
     print('Making request generate_report')
 
@@ -37,7 +42,7 @@ def generate_report(ti):
     ti.xcom_push(key='task_id', value=task_id)
     print(f'Response is {response.content}')
 
-
+# Function to get a report and push report_id to XCom
 def get_report(ti):
     print('Making request get_report')
     task_id = ti.xcom_pull(key='task_id')
@@ -56,12 +61,12 @@ def get_report(ti):
             time.sleep(10)
 
     if not report_id:
-        raise TimeoutError()
+        raise TimeoutError('Timeout error, no servers responce')
 
     ti.xcom_push(key='report_id', value=report_id)
     print(f'Report_id={report_id}')
 
-
+# Function to get an increment and push increment_id to XCom
 def get_increment(date, ti):
     print('Making request get_increment')
     report_id = ti.xcom_pull(key='report_id')
@@ -78,7 +83,7 @@ def get_increment(date, ti):
     ti.xcom_push(key='increment_id', value=increment_id)
     print(f'increment_id={increment_id}')
 
-
+# Function to upload data to staging
 def upload_data_to_staging(filename, date, pg_table, pg_schema, ti):
     increment_id = ti.xcom_pull(key='increment_id')
     s3_filename = f'https://storage.yandexcloud.net/s3-sprint3/cohort_{cohort}/{nickname}/project/{increment_id}/{filename}'
@@ -99,20 +104,28 @@ def upload_data_to_staging(filename, date, pg_table, pg_schema, ti):
 
     postgres_hook = PostgresHook(postgres_conn_id)
     engine = postgres_hook.get_sqlalchemy_engine()
+
+    
+    sql_delete='''delete from staging.user_order_log as uol
+    where uol.date_time::Date = '{date}'::Date;'''
+    postgres_hook.run(sql_delete.replace('{date}', date))
+    
     row_count = df.to_sql(pg_table, engine, schema=pg_schema, if_exists='append', index=False)
     print(f'{row_count} rows was inserted')
 
-
+# Default arguments for the DAG
 args = {
     "owner": "student",
     'email': ['student@example.com'],
     'email_on_failure': False,
     'email_on_retry': False,
-    'retries': 0
+    'retries': 3
 }
 
+# Airflow template variable {{ ds }} for the business date
 business_dt = '{{ ds }}'
 
+# DAG named 'sales_mart'
 with DAG(
         'sales_mart',
         default_args=args,
@@ -120,6 +133,7 @@ with DAG(
         catchup=True,
         start_date=datetime.today() - timedelta(days=7),
         end_date=datetime.today() - timedelta(days=1),
+	max_active_runs = 1
 ) as dag:
     generate_report = PythonOperator(
         task_id='generate_report',
@@ -142,20 +156,15 @@ with DAG(
                    'pg_table': 'user_order_log',
                    'pg_schema': 'staging'})
 
-    update_d_item_table = PostgresOperator(
-        task_id='update_d_item',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_item.sql")
-
-    update_d_customer_table = PostgresOperator(
-        task_id='update_d_customer',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_customer.sql")
-
-    update_d_city_table = PostgresOperator(
-        task_id='update_d_city',
-        postgres_conn_id=postgres_conn_id,
-        sql="sql/mart.d_city.sql")
+    dimension_tasks = list()
+    for i in ['d_city', 'd_item', 'd_customer']:
+        dimension_tasks.append(PostgresOperator(
+            task_id = f'load_{i}',
+            postgres_conn_id = 'postgresql_de',
+            sql = f'sql/mart.{i}.sql',
+            dag = dag
+        )
+    )    
 
     update_f_sales = PostgresOperator(
         task_id='update_f_sales',
@@ -164,11 +173,20 @@ with DAG(
         parameters={"date": {business_dt}}
     )
 
-    (
+update_f_customer_retention = PostgresOperator(
+        task_id='update_f_customer_retention',
+        postgres_conn_id=postgres_conn_id,
+        sql="sql/mart.f_customer_retention.sql",
+        parameters={"date": {business_dt}}
+    )
+
+# Task dependencies using bitshift
+(
             generate_report
             >> get_report
             >> get_increment
             >> upload_user_order_inc
-            >> [update_d_item_table, update_d_city_table, update_d_customer_table]
+            >> dimension_tasks
             >> update_f_sales
+            >> update_f_customer_retention
     )
